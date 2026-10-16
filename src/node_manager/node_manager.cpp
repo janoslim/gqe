@@ -51,9 +51,13 @@
 #include <arrow/type.h>
 #include <signal.h>
 
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
 #include <format>
 #include <future>
 #include <stdexcept>
+#include <string_view>
 #include <unordered_set>
 #include <vector>
 
@@ -582,11 +586,33 @@ gqe::optimizer::optimization_configuration make_default_optimizer_rules()
     {});
 }
 
+// flowcsd observation: CLOCK_MONOTONIC nanoseconds (libstdc++ steady_clock), so query timestamps
+// can be aligned with host-side samplers and traces that use the same clock.
+int64_t monotonic_ns()
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+           std::chrono::steady_clock::now().time_since_epoch())
+    .count();
+}
+
+// flowcsd observation switch: FLOWCSD_TIMING=0 turns the timing record off (unset or any other
+// value keeps it on), so the study can compare wall time with and without it on one build.
+bool timing_enabled()
+{
+  static bool const enabled = [] {
+    char const* value = std::getenv("FLOWCSD_TIMING");
+    return value == nullptr || std::string_view(value) != "0";
+  }();
+  return enabled;
+}
+
 }  // namespace
 
 std::shared_ptr<arrow::RecordBatch> node_manager::execute_substrait_query(void const* data,
                                                                           std::size_t size)
 {
+  bool const record_timing  = timing_enabled();
+  auto const query_start_ns = record_timing ? monotonic_ns() : 0;
   std::scoped_lock guard(_execute_mutex);
 
   gqe::substrait_parser parser(_catalog.get(), &_config.opt_params);
@@ -611,7 +637,8 @@ std::shared_ptr<arrow::RecordBatch> node_manager::execute_substrait_query(void c
   GQE_LOG_TRACE("Optimized logical plan:\n{}", optimized->to_string());
 
   gqe::physical_plan_builder plan_builder(_catalog.get(), &_config.opt_params);
-  auto physical_plan = plan_builder.build(optimized.get());
+  auto physical_plan     = plan_builder.build(optimized.get());
+  auto const plan_end_ns = record_timing ? monotonic_ns() : 0;
   GQE_LOG_TRACE("Physical plan:\n{}", physical_plan->to_string());
 
   // If this query reads a statistics table, lazily re-materialize it from the catalog before the
@@ -620,8 +647,15 @@ std::shared_ptr<arrow::RecordBatch> node_manager::execute_substrait_query(void c
   physical_plan->accept(collector);
   refresh_stats_tables_if_stale(collector.table_names);
 
-  auto batch = execute_on_task_managers(physical_plan).batch;
-  return relabel_batch_columns(std::move(batch), query.output_column_names);
+  auto batch  = execute_on_task_managers(physical_plan).batch;
+  auto result = relabel_batch_columns(std::move(batch), query.output_column_names);
+  if (record_timing) {
+    GQE_LOG_INFO("flowcsd_timing node_manager query_start_ns={} plan_end_ns={} query_end_ns={}",
+                 query_start_ns,
+                 plan_end_ns,
+                 monotonic_ns());
+  }
+  return result;
 }
 
 std::optional<gqe::table_statistics> node_manager::execute_substrait_statement(void const* data,

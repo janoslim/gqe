@@ -36,7 +36,11 @@
 #include <arrow/io/api.h>
 #include <arrow/ipc/api.h>
 
+#include <chrono>
+#include <cstdint>
+#include <cstdlib>
 #include <format>
+#include <string_view>
 
 namespace gqe::task_manager {
 
@@ -107,6 +111,26 @@ std::unique_ptr<cudf::table> arrow_batch_to_cudf(arrow::RecordBatch const& batch
   return table;
 }
 
+// flowcsd observation: CLOCK_MONOTONIC nanoseconds (libstdc++ steady_clock), so phase timestamps
+// can be aligned with host-side samplers and traces that use the same clock.
+int64_t monotonic_ns()
+{
+  return std::chrono::duration_cast<std::chrono::nanoseconds>(
+           std::chrono::steady_clock::now().time_since_epoch())
+    .count();
+}
+
+// flowcsd observation switch: FLOWCSD_TIMING=0 turns the timing record off (unset or any other
+// value keeps it on), so the study can compare wall time with and without it on one build.
+bool timing_enabled()
+{
+  static bool const enabled = [] {
+    char const* value = std::getenv("FLOWCSD_TIMING");
+    return value == nullptr || std::string_view(value) != "0";
+  }();
+  return enabled;
+}
+
 }  // namespace
 
 plan_executor::plan_executor(task_manager_context* ctx, int rank, bool multi_process)
@@ -120,6 +144,8 @@ service::execution_result plan_executor::operator()(std::shared_ptr<physical::re
                                                     gqe::optimization_parameters opt_params)
 {
   GQE_LOG_INFO("Task manager rank {} executing query {}", _rank, query_id);
+  bool const record_timing = timing_enabled();
+  auto const start_ns      = record_timing ? monotonic_ns() : 0;
   // Set the device on this thread before any NVTX push so callback plugins see the right device.
   GQE_CUDA_TRY(cudaSetDevice(_rank));
   utility::nvtx_scoped_range execute_range("execute_plan");
@@ -170,6 +196,7 @@ service::execution_result plan_executor::operator()(std::shared_ptr<physical::re
     gqe::task_graph_builder graph_builder(ctx_ref, &_cache);
     task_graph = graph_builder.build(plan.get());
   }
+  auto const build_end_ns = record_timing ? monotonic_ns() : 0;
 
   {
     utility::nvtx_scoped_range exec_range("execute_task_graph");
@@ -179,6 +206,7 @@ service::execution_result plan_executor::operator()(std::shared_ptr<physical::re
       gqe::execute_task_graph_single_gpu(ctx_ref, task_graph.get());
     }
   }
+  auto const execute_end_ns = record_timing ? monotonic_ns() : 0;
 
   service::execution_result result;
 
@@ -206,6 +234,17 @@ service::execution_result plan_executor::operator()(std::shared_ptr<physical::re
     }
   }
 
+  if (record_timing) {
+    GQE_LOG_INFO(
+      "flowcsd_timing task_manager rank={} query={} start_ns={} build_end_ns={} execute_end_ns={} "
+      "collect_end_ns={}",
+      _rank,
+      query_id,
+      start_ns,
+      build_end_ns,
+      execute_end_ns,
+      monotonic_ns());
+  }
   return result;
 }
 
