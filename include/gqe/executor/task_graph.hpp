@@ -32,6 +32,8 @@
 
 namespace gqe {
 
+class spill_set;  // executor/spill.hpp
+
 struct task_graph {
   /**
    * @brief Root tasks of the task graph.
@@ -118,6 +120,24 @@ class task_graph_builder {
   std::vector<std::shared_ptr<task>> generate_partition_tasks(
     physical::relation* child_relation, std::vector<expression*> const& partition_condition);
 
+  // flowcsd spill mode (executor/spill.hpp): wrap each input task in a spill_partition_task that
+  // keeps its key partitions in GPU memory or writes them to SSD, then close the stage so that every
+  // partition is complete before it is used.
+  std::vector<std::shared_ptr<task>> generate_spill_partition_tasks(
+    std::vector<std::shared_ptr<task>> input_tasks,
+    std::vector<expression const*> const& key_exprs,
+    cudf::size_type key_column_offset,
+    std::shared_ptr<spill_set> const& spill,
+    int32_t side);
+
+  // flowcsd spill mode: the operator's SF-independent name for the partition table
+  // (spill_partitions.csv), `<kind>(<tables>):keys=<keys>:<ordinal>`: the sorted tables read under
+  // it joined by '+', and how many earlier operators of this query had the same kind, tables and
+  // keys.
+  std::string next_spill_signature(std::string const& kind,
+                                   std::vector<std::string> tables,
+                                   std::size_t keys);
+
   // A physical relation visitor used for generating a task graph for the physical relation and its
   // descendants.
   //
@@ -140,6 +160,10 @@ class task_graph_builder {
     void visit(physical::user_defined_relation* relation) override;
     void visit(physical::gen_ident_col_relation* relation) override;
     void visit(physical::shuffle_relation* relation) override;
+
+    // flowcsd spill mode (executor/spill.hpp): generate an equality join as a hybrid hash join
+    // (resident and SSD partitions). Returns false, generating nothing, for other joins.
+    bool generate_spilled_join(physical::broadcast_join_relation* relation);
 
     // Check the task cache in `_builder`. If the relation is found in the cache, the retrieved
     // tasks are copied to `_generated_tasks`, and the function returns true. Otherwise, the
@@ -177,6 +201,8 @@ class task_graph_builder {
   int32_t _current_task_id                                        = 0;
   std::unordered_map<physical::relation*, std::vector<std::weak_ptr<task>>> _tasks_cache;
   std::unique_ptr<table_statistics_manager> _write_statistics;
+  // flowcsd spill mode: operators named so far, per signature without its ordinal.
+  std::unordered_map<std::string, int32_t> _spill_signature_counts;
 };
 
 }  // namespace gqe

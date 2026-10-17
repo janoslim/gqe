@@ -88,6 +88,9 @@ add_library(
   executor/task_graph.cpp
   executor/partition.cpp
   executor/partition_merge.cpp
+  executor/spill.cpp
+  executor/spill_filter.cu
+  executor/spill_narrowing.cu
   executor_next/utilities/thread_event.cpp
   expression/binary_op.cpp
   expression/cast.cpp
@@ -226,6 +229,9 @@ target_link_libraries(gqe PUBLIC spdlog::spdlog)
 target_link_libraries(gqe PUBLIC substrait)
 target_link_libraries(gqe PRIVATE Boost::headers)
 target_link_libraries(gqe PRIVATE Threads::Threads)
+# flowcsd spill mode: spill partitions are written and read with cuFile (GDS)
+# through a registered GPU staging buffer (src/executor/spill.cpp).
+target_link_libraries(gqe PRIVATE CUDA::cuFile)
 # Dynamic link nvcomp: the .so is installed alongside the executables (see
 # cmake/nvcomp.cmake) and resolved via $ORIGIN/../${GQE_INSTALL_LIBDIR} RPATH.
 target_link_libraries(gqe PUBLIC nvcomp::nvcomp)

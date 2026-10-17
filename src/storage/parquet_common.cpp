@@ -109,6 +109,17 @@ std::unique_ptr<cudf::table> enforce_data_types(std::unique_ptr<cudf::table> inp
     auto const expected_type = data_type[i];
     if (column_view.type() == expected_type) {
       converted_columns.push_back(std::move(input_columns[i]));
+    } else if ((column_view.type().id() == cudf::type_id::DECIMAL64 &&
+                expected_type.id() == cudf::type_id::INT64) ||
+               (column_view.type().id() == cudf::type_id::DECIMAL32 &&
+                expected_type.id() == cudf::type_id::INT32)) {
+      // Integer-encoded Parquet (-int) stores scaled cents as physical INT64/INT32 with a Decimal
+      // logical type; re-tag the underlying integer buffer without cudf::cast dividing by 10^scale.
+      auto const size       = column_view.size();
+      auto const null_count = column_view.null_count();
+      auto contents         = input_columns[i]->release();
+      converted_columns.push_back(std::make_unique<cudf::column>(
+        expected_type, size, std::move(*contents.data), std::move(*contents.null_mask), null_count));
     } else {
       converted_columns.push_back(cast(column_view, expected_type, stream, mr));
     }

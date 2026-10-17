@@ -18,6 +18,7 @@
 #include <gqe/task_manager/plan_executor.hpp>
 
 #include <gqe/context_reference.hpp>
+#include <gqe/executor/spill.hpp>
 #include <gqe/executor/task_graph.hpp>
 #include <gqe/query_context.hpp>
 #include <gqe/rpc/serialization/statistics.hpp>
@@ -189,6 +190,26 @@ service::execution_result plan_executor::operator()(std::shared_ptr<physical::re
     if (mp_ctx) migration_svc = mp_ctx->migration_service.get();
   }
   query_registration_guard guard{migration_svc, query_id};
+
+  // flowcsd spill mode: the spill I/O (registered staging buffers and I/O threads) shared by every
+  // operator of the query, and one `flowcsd_spill` line per query with the spill counters. The
+  // guard is declared before the task graph, so it releases the I/O and logs after the graph (and
+  // every spill file) is gone, also when the query fails.
+  gqe::reset_spill_counters();
+  struct spill_query_guard {
+    int rank;
+    utility::uuid query_id;
+    std::shared_ptr<gqe::spill_io> io;
+    ~spill_query_guard()
+    {
+      io.reset();
+      gqe::log_spill_counters(rank, query_id);
+    }
+  };
+  spill_query_guard spill_query{
+    _rank,
+    query_id,
+    gqe::get_spill_settings().partitions > 0 ? gqe::acquire_spill_io() : nullptr};
 
   std::unique_ptr<gqe::task_graph> task_graph;
   {

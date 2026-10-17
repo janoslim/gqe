@@ -30,6 +30,7 @@
 #include <gqe/executor/project.hpp>
 #include <gqe/executor/read.hpp>
 #include <gqe/executor/sort.hpp>
+#include <gqe/executor/spill.hpp>
 #include <gqe/executor/task.hpp>
 #include <gqe/executor/window.hpp>
 #include <gqe/executor/write.hpp>
@@ -59,11 +60,15 @@
 #include <gqe/utility/logger.hpp>
 
 #include <cudf/utilities/traits.hpp>
+#include <rmm/cuda_device.hpp>
 
 #include <algorithm>
+#include <array>
 #include <exception>
+#include <format>
 #include <limits>
 #include <memory>
+#include <set>
 #include <stack>
 #include <stdexcept>
 #include <thread>
@@ -535,6 +540,384 @@ void task_graph_builder::generate_task_graph_visitor::visit(physical::write_rela
   update_cache(relation);
 }
 
+namespace {
+
+// flowcsd spill mode: the equality keys of a join condition, parsed as join_task parses them
+// (join.cpp parse_join_condition): the operands of EQUAL / NULL_EQUALS under AND.
+void collect_equality_keys(expression const* condition,
+                           std::vector<expression const*>& left_keys,
+                           std::vector<expression const*>& right_keys)
+{
+  if (condition->type() != expression::expression_type::binary_op) { return; }
+  auto const* binary_op = dynamic_cast<binary_op_expression const*>(condition);
+  auto const operands   = condition->children();
+  switch (binary_op->binary_operator()) {
+    case cudf::binary_operator::EQUAL:
+    case cudf::binary_operator::NULL_EQUALS:
+      left_keys.push_back(operands[0]);
+      right_keys.push_back(operands[1]);
+      break;
+    case cudf::binary_operator::LOGICAL_AND:
+    case cudf::binary_operator::NULL_LOGICAL_AND:
+      collect_equality_keys(operands[0], left_keys, right_keys);
+      collect_equality_keys(operands[1], left_keys, right_keys);
+      break;
+    default: break;
+  }
+}
+
+// flowcsd spill mode: number of Parquet files read under `relation` (the planner has no row
+// counts, catalog.cpp:113-117, so files stand in for size), and the names of the tables read (a
+// table read twice is named twice).
+int64_t count_input_files(physical::relation* relation,
+                          storage::table_provider const* provider,
+                          std::vector<std::string>& table_names)
+{
+  int64_t files = 0;
+  if (auto* read = dynamic_cast<physical::read_relation*>(relation)) {
+    files += provider->get_table(read->table_name())->max_concurrent_readers();
+    table_names.push_back(read->table_name());
+  }
+  for (auto* child : relation->children_unsafe()) {
+    files += count_input_files(child, provider, table_names);
+  }
+  return files;
+}
+
+// flowcsd spill mode: names joined by `separator` in their order.
+std::string join_names(std::vector<std::string> const& names, char const* separator)
+{
+  std::string joined;
+  for (auto const& name : names) {
+    if (!joined.empty()) { joined += separator; }
+    joined += name;
+  }
+  return joined;
+}
+
+// flowcsd spill mode: whether a join's build input is filtered: its subtree has a filter, a read
+// with a pushed-down partial filter, or a left semi or anti join. An unfiltered TPC-H build side
+// holds the key of every probe row (foreign keys), so a probe-side filter would drop nothing.
+bool build_is_filtered(physical::relation* relation)
+{
+  if (dynamic_cast<physical::filter_relation*>(relation) != nullptr) { return true; }
+  if (auto* read = dynamic_cast<physical::read_relation*>(relation)) {
+    if (read->partial_filter_unsafe() != nullptr) { return true; }
+  }
+  if (auto* join = dynamic_cast<physical::join_relation_base*>(relation)) {
+    auto const join_type = join->join_type();
+    if (join_type == join_type_type::left_semi || join_type == join_type_type::left_anti) {
+      return true;
+    }
+  }
+  auto const children = relation->children_unsafe();
+  return std::any_of(children.begin(), children.end(), build_is_filtered);
+}
+
+// flowcsd spill mode: the column positions an expression reads.
+void collect_column_references(expression const* expr, std::set<cudf::size_type>& columns)
+{
+  if (expr->type() == expression::expression_type::column_reference) {
+    columns.insert(static_cast<column_reference_expression const*>(expr)->column_idx());
+  }
+  for (auto const* child : expr->children()) {
+    collect_column_references(child, columns);
+  }
+}
+
+char const* join_type_name(join_type_type join_type)
+{
+  switch (join_type) {
+    case join_type_type::inner: return "inner";
+    case join_type_type::left: return "left";
+    case join_type_type::left_semi: return "left_semi";
+    case join_type_type::left_anti: return "left_anti";
+    default: return "other";
+  }
+}
+
+}  // namespace
+
+std::vector<std::shared_ptr<task>> task_graph_builder::generate_spill_partition_tasks(
+  std::vector<std::shared_ptr<task>> input_tasks,
+  std::vector<expression const*> const& key_exprs,
+  cudf::size_type key_column_offset,
+  std::shared_ptr<spill_set> const& spill,
+  int32_t side)
+{
+  std::vector<std::shared_ptr<task>> partition_tasks;
+  partition_tasks.reserve(input_tasks.size());
+  for (auto& input_task : input_tasks) {
+    partition_tasks.push_back(std::make_shared<spill_partition_task>(_ctx_ref,
+                                                                     _current_task_id,
+                                                                     _current_stage_id,
+                                                                     std::move(input_task),
+                                                                     clone_expressions(key_exprs),
+                                                                     key_column_offset,
+                                                                     spill,
+                                                                     side));
+    _current_task_id++;
+  }
+  insert_pipeline_breaker(partition_tasks);
+  return partition_tasks;
+}
+
+std::string task_graph_builder::next_spill_signature(std::string const& kind,
+                                                     std::vector<std::string> tables,
+                                                     std::size_t keys)
+{
+  // No build side in it: the planner picks the build side from file counts, which differ between
+  // scale factors.
+  std::sort(tables.begin(), tables.end());
+  auto const name    = std::format("{}({}):keys={}", kind, join_names(tables, "+"), keys);
+  auto const ordinal = _spill_signature_counts[name]++;
+  return std::format("{}:{}", name, ordinal);
+}
+
+bool task_graph_builder::generate_task_graph_visitor::generate_spilled_join(
+  physical::broadcast_join_relation* relation)
+{
+  auto const children = relation->children_unsafe();
+  std::vector<expression const*> left_keys;
+  std::vector<expression const*> right_keys;
+  collect_equality_keys(relation->condition(), left_keys, right_keys);
+
+  // Which input a broadcast join would hold whole in GPU memory (build) and which it streams
+  // (probe).
+  bool const build_is_right = relation->policy() == physical::broadcast_policy::right;
+  int32_t const build_side  = build_is_right ? 1 : 0;
+  int32_t const probe_side  = 1 - build_side;
+  auto const join_type      = relation->join_type();
+  std::vector<std::string> build_tables;
+  std::vector<std::string> probe_tables;
+  auto const build_files =
+    count_input_files(children[build_side], _builder->_table_provider, build_tables);
+  auto const probe_files =
+    count_input_files(children[probe_side], _builder->_table_provider, probe_tables);
+  // Filter conditions inside a join come only from hand-written plans (plan_join.cpp:155-156), and
+  // join_task accepts them only together with the hash-map cache, which a Grace join cannot share.
+  bool const has_filter_condition =
+    relation->left_filter_condition() != nullptr || relation->right_filter_condition() != nullptr;
+  // A left join that builds on its left input would emit its unmatched build rows once per probe
+  // task in stage B; it keeps the upstream path (GQE's planner does not build such a plan).
+  bool const left_join_builds_left = join_type == join_type_type::left && build_side == 0;
+  // Every other equality join goes through the hybrid path; how much of it spills is decided at run
+  // time from the actual bytes (a join whose build side fits spills nothing).
+  bool const hybrid = !left_keys.empty() && !has_filter_condition && !left_join_builds_left;
+  // An inner join, and a left semi join that builds on the right, drop every probe row without a
+  // matching build key. With a filtered build side they get a probe-side filter that drops those
+  // rows before partitioning (spill_filter.hpp); an unfiltered build side holds every probe key.
+  bool const drops_unmatched_probe_rows =
+    join_type == join_type_type::inner ||
+    (join_type == join_type_type::left_semi && build_side == 1);
+  bool const filtered_build = build_is_filtered(children[build_side]);
+  bool const filters_probe  = drops_unmatched_probe_rows && filtered_build;
+  // The columns the join reads neither in its condition nor in its output are left out of written
+  // slices (spill_operator_plan::dead_columns); right indices are offset by the left column count.
+  auto const left_num_columns =
+    static_cast<cudf::size_type>(children[0]->output_data_types().size());
+  auto const right_num_columns =
+    static_cast<cudf::size_type>(children[1]->output_data_types().size());
+  std::set<cudf::size_type> used_columns;
+  collect_column_references(relation->condition(), used_columns);
+  for (auto const column : relation->projection_indices()) {
+    used_columns.insert(column);
+  }
+  std::array<std::vector<cudf::size_type>, 2> dead_columns;
+  for (cudf::size_type column = 0; column < left_num_columns; column++) {
+    if (used_columns.count(column) == 0) { dead_columns[0].push_back(column); }
+  }
+  for (cudf::size_type column = 0; column < right_num_columns; column++) {
+    if (used_columns.count(left_num_columns + column) == 0) { dead_columns[1].push_back(column); }
+  }
+  auto const description = std::format(
+    "join type={} build_side={} build_tables={} build_files={} probe_tables={} probe_files={} "
+    "equality_keys={} left_columns={} left_unused={} right_columns={} right_unused={} "
+    "filtered_build={}",
+    join_type_name(join_type),
+    build_is_right ? "right" : "left",
+    join_names(build_tables, ","),
+    build_files,
+    join_names(probe_tables, ","),
+    probe_files,
+    left_keys.size(),
+    left_num_columns,
+    dead_columns[0].size(),
+    right_num_columns,
+    dead_columns[1].size(),
+    filtered_build);
+  if (!hybrid) {
+    GQE_LOG_INFO("flowcsd_spill_plan {} hybrid=false{}",
+                 description,
+                 left_join_builds_left ? " hybrid_off=left_join_builds_left" : "");
+    return false;
+  }
+  auto tables = build_tables;
+  tables.insert(tables.end(), probe_tables.begin(), probe_tables.end());
+  auto const signature = _builder->next_spill_signature(
+    std::string(join_type_name(join_type)) + "_join", std::move(tables), left_keys.size());
+  auto const operator_partition_count = spill_partitions_for(signature);
+  auto const partitions               = operator_partition_count.partitions;
+  GQE_LOG_INFO("flowcsd_spill_plan {} hybrid=true signature={} partitions={} partitions_from={}",
+               description,
+               signature,
+               partitions,
+               operator_partition_count.from_table ? "table" : "default");
+  count_hybrid_operator(hybrid_operator::join);
+
+  // A semi or anti join that builds on its left input must see every probe row of a key at once
+  // (the broadcast path merges position lists across probe tasks), so its probe rows cannot be
+  // joined per probe task: it runs as a Grace join with every partition on SSD.
+  bool const semi_or_anti =
+    join_type == join_type_type::left_semi || join_type == join_type_type::left_anti;
+  bool const streams_probe = !(semi_or_anti && build_side == 0);
+  auto const& parameters   = _builder->_ctx_ref._query_context->parameters;
+  // Stages B and C share one stage: C's reads rely on B's pipelines having run first, in order.
+  GQE_EXPECTS(parameters.num_workers == 1, "spill mode needs GQE_NUM_WORKERS=1");
+  auto const pool_bytes =
+    parameters.max_query_memory.value_or(rmm::available_device_memory().second);
+  // The build input comes first: the number of its tasks projects k and sizes the filter.
+  auto build_input_tasks = _builder->generate_tasks(children[build_side]);
+  auto const build_tasks = static_cast<int64_t>(build_input_tasks.size());
+  spill_operator_plan plan;
+  plan.num_sides                = 2;
+  plan.description              = description;
+  plan.signature                = signature;
+  plan.partitions               = partitions;
+  plan.held_side                = streams_probe ? build_side : -1;
+  plan.probe_side               = probe_side;
+  plan.held_input_tasks         = build_tasks;
+  plan.probe_filter_build_tasks = filters_probe ? build_tasks : int64_t{0};
+  plan.dead_columns             = dead_columns;
+  plan.resident_budget_bytes    = spill_resident_budget_bytes(pool_bytes);
+  plan.pool_bytes               = pool_bytes;
+  auto spill                    = make_spill_set(std::move(plan));
+  // The right keys reference the concatenation of both inputs (join.cpp:308-312).
+  std::array<std::vector<expression const*>, 2> const keys{left_keys, right_keys};
+  std::array<cudf::size_type, 2> const key_column_offsets{0, left_num_columns};
+  gqe::unique_keys_policy const unique_keys_pol =
+    parameters.join_use_unique_keys ? relation->unique_keys_policy() : gqe::unique_keys_policy::none;
+  // Join tasks take (left, right); put the build and probe inputs on the join's own sides. Perfect
+  // hashing stays off: libperfect sizes its table by the significant key bits
+  // (xor_hash_table.cuh:773-786), which every hash partition still spans, so the table would not
+  // shrink with the partition (2^33 slots x 4 B for l_orderkey at SF1000).
+  auto const generate_join = [&](std::shared_ptr<task> build_input,
+                                 std::shared_ptr<task> probe_input,
+                                 std::shared_ptr<join_hash_map_cache> hash_map_cache) {
+    auto left_input  = build_side == 0 ? std::move(build_input) : std::move(probe_input);
+    auto right_input = build_side == 0 ? std::move(probe_input) : std::move(build_input);
+    auto joined      = std::make_shared<join_task>(_builder->_ctx_ref,
+                                              _builder->_current_task_id,
+                                              _builder->_current_stage_id,
+                                              std::move(left_input),
+                                              std::move(right_input),
+                                              join_type,
+                                              relation->condition()->clone(),
+                                              relation->projection_indices(),
+                                              std::move(hash_map_cache),
+                                              /*materialize_output=*/true,
+                                              unique_keys_pol,
+                                              /*perfect_hashing=*/false,
+                                              /*left_filter_condition=*/nullptr,
+                                              /*right_filter_condition=*/nullptr,
+                                              /*mark_join=*/false);
+    _builder->_current_task_id++;
+    return joined;
+  };
+
+  // Stage A: build input -> build partitions, resident while they fit the budget, else on SSD.
+  auto build_partitions = _builder->generate_spill_partition_tasks(std::move(build_input_tasks),
+                                                                  keys[build_side],
+                                                                  key_column_offsets[build_side],
+                                                                  spill,
+                                                                  build_side);
+  auto probe_input_tasks = _builder->generate_tasks(children[probe_side]);
+  std::vector<std::shared_ptr<task>> probe_partitions;  // Grace path only
+  if (streams_probe) {
+    // Stage B: split each probe input by partition. Rows of resident partitions join the resident
+    // build at once (one join per probe input, like the broadcast join; inner and left joins share
+    // one hash table); rows of spilled partitions go to SSD.
+    auto resident_build = std::make_shared<spill_resident_build_task>(_builder->_ctx_ref,
+                                                                      _builder->_current_task_id,
+                                                                      _builder->_current_stage_id,
+                                                                      build_partitions,
+                                                                      spill,
+                                                                      build_side);
+    _builder->_current_task_id++;
+    std::shared_ptr<join_hash_map_cache> hash_map_cache;
+    if (join_type == join_type_type::inner || join_type == join_type_type::left) {
+      hash_map_cache = std::make_shared<join_hash_map_cache>(
+        build_side == 1 ? join_hash_map_cache::build_location::right
+                        : join_hash_map_cache::build_location::left);
+    }
+    for (auto& probe_input : probe_input_tasks) {
+      auto split = std::make_shared<spill_probe_split_task>(_builder->_ctx_ref,
+                                                            _builder->_current_task_id,
+                                                            _builder->_current_stage_id,
+                                                            std::move(probe_input),
+                                                            clone_expressions(keys[probe_side]),
+                                                            key_column_offsets[probe_side],
+                                                            spill,
+                                                            probe_side);
+      _builder->_current_task_id++;
+      _generated_tasks.push_back(generate_join(resident_build, std::move(split), hash_map_cache));
+    }
+  } else {
+    probe_partitions = _builder->generate_spill_partition_tasks(std::move(probe_input_tasks),
+                                                               keys[probe_side],
+                                                               key_column_offsets[probe_side],
+                                                               spill,
+                                                               probe_side);
+  }
+
+  // Stage C (the same stage as B, after it): one join per partition from its spilled data, like
+  // the shuffle join (visit(shuffle_join_relation)): no shared hash-map cache, no mark join.
+  // Partitions without spill data (joined in stage B) do not run (spill_partition_done_task). How a
+  // partition join's output rows tell how many of its spilled probe rows matched (logged per
+  // operator; spill.hpp spill_match_rule):
+  bool const build_keys_unique =
+    unique_keys_pol ==
+    (build_side == 0 ? gqe::unique_keys_policy::left : gqe::unique_keys_policy::right);
+  auto match_rule = spill_match_rule::unknown;
+  if (join_type == join_type_type::inner && build_keys_unique) {
+    match_rule = spill_match_rule::output_rows;
+  } else if (join_type == join_type_type::left_semi && build_side == 1) {
+    match_rule = spill_match_rule::output_rows;
+  } else if (join_type == join_type_type::left_anti && build_side == 1) {
+    match_rule = spill_match_rule::probe_rows_minus_output;
+  }
+  auto const output_types = relation->output_data_types();
+  for (int32_t partition = 0; partition < partitions; partition++) {
+    auto build_read = std::make_shared<spill_read_task>(_builder->_ctx_ref,
+                                                        _builder->_current_task_id,
+                                                        _builder->_current_stage_id,
+                                                        build_partitions,
+                                                        spill,
+                                                        build_side,
+                                                        partition);
+    _builder->_current_task_id++;
+    auto probe_read = std::make_shared<spill_read_task>(_builder->_ctx_ref,
+                                                        _builder->_current_task_id,
+                                                        _builder->_current_stage_id,
+                                                        probe_partitions,
+                                                        spill,
+                                                        probe_side,
+                                                        partition);
+    _builder->_current_task_id++;
+    auto partition_join = generate_join(std::move(build_read), std::move(probe_read), nullptr);
+    _generated_tasks.push_back(std::make_shared<spill_partition_done_task>(_builder->_ctx_ref,
+                                                                           _builder->_current_task_id,
+                                                                           _builder->_current_stage_id,
+                                                                           std::move(partition_join),
+                                                                           spill,
+                                                                           partition,
+                                                                           match_rule,
+                                                                           output_types));
+    _builder->_current_task_id++;
+  }
+  return true;
+}
+
 void task_graph_builder::generate_task_graph_visitor::visit(
   physical::broadcast_join_relation* relation)
 {
@@ -545,6 +928,12 @@ void task_graph_builder::generate_task_graph_visitor::visit(
     throw std::logic_error("Broadcast join does not support full join or single join");
 
   auto const children = relation->children_unsafe();
+
+  // flowcsd spill mode: a hybrid hash join (resident and SSD partitions) instead of a broadcast join.
+  if (get_spill_settings().partitions > 0 && generate_spilled_join(relation)) {
+    update_cache(relation);
+    return;
+  }
 
   bool cache_enabled = _builder->_ctx_ref._query_context->parameters.join_use_hash_map_cache;
 
@@ -1097,75 +1486,153 @@ void task_graph_builder::generate_task_graph_visitor::visit(
     _builder->_current_task_id++;
   }
 
-  // Step 2: Concatenate all partitions into a single partition
-  auto concatenated_task = _builder->concatenate(std::move(first_aggregation_tasks));
+  // Steps 3 and 4 for one input: the concatenated partial results, or in spill mode one partition
+  // of them.
+  auto const generate_final_aggregation = [&](std::shared_ptr<task> partial_results,
+                                              bool final_perfect_hashing) -> std::shared_ptr<task> {
+    // Step 3: Apply aggregations on the concatenated partition
+    // Keys for the second aggregation are the first few columns of the concatenated table
+    aggregation_keys_type second_aggregation_keys;
+    second_aggregation_keys.reserve(keys.size());
+    for (std::size_t column_idx = 0; column_idx < keys.size(); column_idx++)
+      second_aggregation_keys.push_back(std::make_unique<column_reference_expression>(column_idx));
 
-  // Step 3: Apply aggregations on the concatenated partition
-  // Keys for the second aggregation are the first few columns of the concatenated table
-  aggregation_keys_type second_aggregation_keys;
-  second_aggregation_keys.reserve(keys.size());
-  for (std::size_t column_idx = 0; column_idx < keys.size(); column_idx++)
-    second_aggregation_keys.push_back(std::make_unique<column_reference_expression>(column_idx));
-
-  // Values for the second aggregation depend on the kind of the first aggregation
-  aggregation_values_type second_aggregation_values;
-  second_aggregation_values.reserve(first_aggregation_values.size());
-  for (std::size_t column_idx = 0; column_idx < first_aggregation_values.size(); column_idx++) {
-    second_aggregation_values.emplace_back(
-      get_second_aggregation_kind(first_aggregation_values[column_idx].first),
-      std::make_unique<column_reference_expression>(keys.size() + column_idx));
-  }
-
-  auto second_aggregation_task =
-    std::make_shared<aggregate_task>(_builder->_ctx_ref,
-                                     _builder->_current_task_id,
-                                     _builder->_current_stage_id,
-                                     std::move(concatenated_task),
-                                     std::move(second_aggregation_keys),
-                                     std::move(second_aggregation_values),
-                                     nullptr,
-                                     use_perfect_hashing);
-  _builder->_current_task_id++;
-
-  // Step 4: Post processing
-  std::vector<std::unique_ptr<expression>> output_expressions;
-
-  // Keys don't need post-processing
-  for (std::size_t column_idx = 0; column_idx < keys.size(); column_idx++)
-    output_expressions.push_back(std::make_unique<column_reference_expression>(column_idx));
-
-  std::size_t in_idx = keys.size();
-  for (auto const& value : values) {
-    switch (value.first) {
-      case cudf::aggregation::SUM:
-      case cudf::aggregation::COUNT_VALID:
-      case cudf::aggregation::COUNT_ALL:
-      case cudf::aggregation::MIN:
-      case cudf::aggregation::MAX:
-        // SUM, COUNT_VALID, COUNT_ALL, MIN, MAX do not need post-processing
-        output_expressions.push_back(std::make_unique<column_reference_expression>(in_idx));
-        in_idx++;
-        break;
-      case cudf::aggregation::MEAN:
-        // MEAN needs to divide the SUM by the COUNT_VALID
-        output_expressions.push_back(std::make_unique<divide_expression>(
-          std::make_shared<column_reference_expression>(in_idx),
-          std::make_shared<column_reference_expression>(in_idx + 1)));
-        in_idx += 2;
-        break;
-      default:
-        throw std::logic_error("Unknown aggregation type in task_graph_builder: " +
-                               std::to_string(value.first));
+    // Values for the second aggregation depend on the kind of the first aggregation
+    aggregation_values_type second_aggregation_values;
+    second_aggregation_values.reserve(first_aggregation_values.size());
+    for (std::size_t column_idx = 0; column_idx < first_aggregation_values.size(); column_idx++) {
+      second_aggregation_values.emplace_back(
+        get_second_aggregation_kind(first_aggregation_values[column_idx].first),
+        std::make_unique<column_reference_expression>(keys.size() + column_idx));
     }
-  }
-  assert(in_idx == keys.size() + first_aggregation_values.size());
 
-  _generated_tasks.push_back(std::make_shared<project_task>(_builder->_ctx_ref,
-                                                            _builder->_current_task_id,
-                                                            _builder->_current_stage_id,
-                                                            std::move(second_aggregation_task),
-                                                            std::move(output_expressions)));
-  _builder->_current_task_id++;
+    auto second_aggregation_task =
+      std::make_shared<aggregate_task>(_builder->_ctx_ref,
+                                       _builder->_current_task_id,
+                                       _builder->_current_stage_id,
+                                       std::move(partial_results),
+                                       std::move(second_aggregation_keys),
+                                       std::move(second_aggregation_values),
+                                       nullptr,
+                                       final_perfect_hashing);
+    _builder->_current_task_id++;
+
+    // Step 4: Post processing
+    std::vector<std::unique_ptr<expression>> output_expressions;
+
+    // Keys don't need post-processing
+    for (std::size_t column_idx = 0; column_idx < keys.size(); column_idx++)
+      output_expressions.push_back(std::make_unique<column_reference_expression>(column_idx));
+
+    std::size_t in_idx = keys.size();
+    for (auto const& value : values) {
+      switch (value.first) {
+        case cudf::aggregation::SUM:
+        case cudf::aggregation::COUNT_VALID:
+        case cudf::aggregation::COUNT_ALL:
+        case cudf::aggregation::MIN:
+        case cudf::aggregation::MAX:
+          // SUM, COUNT_VALID, COUNT_ALL, MIN, MAX do not need post-processing
+          output_expressions.push_back(std::make_unique<column_reference_expression>(in_idx));
+          in_idx++;
+          break;
+        case cudf::aggregation::MEAN:
+          // MEAN needs to divide the SUM by the COUNT_VALID
+          output_expressions.push_back(std::make_unique<divide_expression>(
+            std::make_shared<column_reference_expression>(in_idx),
+            std::make_shared<column_reference_expression>(in_idx + 1)));
+          in_idx += 2;
+          break;
+        default:
+          throw std::logic_error("Unknown aggregation type in task_graph_builder: " +
+                                 std::to_string(value.first));
+      }
+    }
+    assert(in_idx == keys.size() + first_aggregation_values.size());
+
+    auto post_processing_task = std::make_shared<project_task>(_builder->_ctx_ref,
+                                                               _builder->_current_task_id,
+                                                               _builder->_current_stage_id,
+                                                               std::move(second_aggregation_task),
+                                                               std::move(output_expressions));
+    _builder->_current_task_id++;
+    return post_processing_task;
+  };
+
+  // flowcsd spill mode: keyed partial results go through the hybrid path (executor/spill.hpp):
+  // partitioned, resident while they fit the budget, the rest on SSD, and one final aggregation per
+  // partition instead of one over the concatenation of all partial results.
+  bool const spill_partials = get_spill_settings().partitions > 0 && !keys.empty();
+  if (spill_partials) {
+    std::vector<std::string> input_tables;
+    auto const input_files =
+      count_input_files(children[0], _builder->_table_provider, input_tables);
+    auto const description = std::format("aggregation keys={} input_tables={} input_files={}",
+                                         keys.size(),
+                                         join_names(input_tables, ","),
+                                         input_files);
+    auto const signature =
+      _builder->next_spill_signature("aggregation", std::move(input_tables), keys.size());
+    auto const operator_partition_count = spill_partitions_for(signature);
+    auto const partitions               = operator_partition_count.partitions;
+    GQE_LOG_INFO("flowcsd_spill_plan {} hybrid=true signature={} partitions={} partitions_from={}",
+                 description,
+                 signature,
+                 partitions,
+                 operator_partition_count.from_table ? "table" : "default");
+    count_hybrid_operator(hybrid_operator::aggregation);
+    auto const& parameters = _builder->_ctx_ref._query_context->parameters;
+    // The resident slices are copied on the compute thread that partitions them, unsynchronized for
+    // other workers' streams.
+    GQE_EXPECTS(parameters.num_workers == 1, "spill mode needs GQE_NUM_WORKERS=1");
+    // The partial results start with their key columns (step 3).
+    std::vector<std::unique_ptr<expression>> partial_keys;
+    for (std::size_t column_idx = 0; column_idx < keys.size(); column_idx++)
+      partial_keys.push_back(std::make_unique<column_reference_expression>(column_idx));
+    auto const pool_bytes =
+      parameters.max_query_memory.value_or(rmm::available_device_memory().second);
+    spill_operator_plan plan;
+    plan.num_sides             = 1;
+    plan.description           = description;
+    plan.signature             = signature;
+    plan.partitions            = partitions;
+    plan.held_side             = 0;
+    plan.held_input_tasks      = static_cast<int64_t>(first_aggregation_tasks.size());
+    plan.resident_budget_bytes = spill_resident_budget_bytes(pool_bytes);
+    plan.pool_bytes            = pool_bytes;
+    auto spill                 = make_spill_set(std::move(plan));
+    auto partition_tasks       = _builder->generate_spill_partition_tasks(
+      std::move(first_aggregation_tasks), utility::to_const_raw_ptrs(partial_keys), 0, spill, 0);
+    // Stage C: one final aggregation per partition; partition 0 brings every resident partition,
+    // and partitions without spill data do not run (spill_partition_done_task).
+    auto const output_types = relation->output_data_types();
+    for (int32_t partition = 0; partition < partitions; partition++) {
+      auto partial_results = std::make_shared<spill_read_task>(_builder->_ctx_ref,
+                                                               _builder->_current_task_id,
+                                                               _builder->_current_stage_id,
+                                                               partition_tasks,
+                                                               spill,
+                                                               /*side=*/0,
+                                                               partition);
+      _builder->_current_task_id++;
+      // Perfect hashing is off for the same reason as in generate_spilled_join.
+      auto final_aggregation = generate_final_aggregation(std::move(partial_results), false);
+      _generated_tasks.push_back(std::make_shared<spill_partition_done_task>(_builder->_ctx_ref,
+                                                                             _builder->_current_task_id,
+                                                                             _builder->_current_stage_id,
+                                                                             std::move(final_aggregation),
+                                                                             spill,
+                                                                             partition,
+                                                                             spill_match_rule::unknown,
+                                                                             output_types));
+      _builder->_current_task_id++;
+    }
+  } else {
+    // Step 2: Concatenate all partitions into a single partition
+    auto concatenated_task = _builder->concatenate(std::move(first_aggregation_tasks));
+    _generated_tasks.push_back(
+      generate_final_aggregation(std::move(concatenated_task), use_perfect_hashing));
+  }
 
   update_cache(relation);
 }
