@@ -18,6 +18,7 @@
 #include <gqe/storage/parquet.hpp>
 
 #include <gqe/expression/column_reference.hpp>
+#include <gqe/memory_resource/managed_query_memory_resource.hpp>
 #include <gqe/query_context.hpp>
 #include <gqe/storage/chunked_parquet_writer.hpp>
 #include <gqe/storage/hive_partitioning.hpp>
@@ -94,6 +95,18 @@ parquet_read_task::parquet_read_task(context_reference ctx_ref,
 
 namespace {
 
+// flowcsd managed-memory: read with cuDF's reader, its buffers (the ones cuFile reads into) from the
+// device scan-buffer pool and the returned table from the managed query pool.
+table_with_metadata read_parquet_cudf_managed(std::vector<std::string> const& file_paths,
+                                              std::vector<std::string> const& column_names)
+{
+  memory_resource::scan_buffer_scope scan_buffers;
+  return read_parquet_cudf(file_paths,
+                           column_names,
+                           cudf::get_default_stream(),
+                           memory_resource::scan_output_resource().value());
+}
+
 // Load a cuDF table from Parquet files listed at `file_paths`, and columns indicated by
 // `column_names`.
 // Note: the `file_paths` argument must not be empty.
@@ -133,13 +146,13 @@ table_with_metadata table_from_parquet(context_reference ctx_ref,
       GQE_LOG_TRACE(error.what());
       GQE_LOG_TRACE("Fallback to cuDF's Parquet reader when loading: " + file_paths[0]);
 
-      result = read_parquet_cudf(file_paths, column_names);
+      result = read_parquet_cudf_managed(file_paths, column_names);
     }
   } else {
-    result = read_parquet_cudf(file_paths, column_names);
+    result = read_parquet_cudf_managed(file_paths, column_names);
   }
 #else
-  result = read_parquet_cudf(file_paths, column_names);
+  result = read_parquet_cudf_managed(file_paths, column_names);
 #endif
 
   assert(result.table->num_columns() == static_cast<cudf::size_type>(column_names.size()));

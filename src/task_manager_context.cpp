@@ -20,6 +20,7 @@
 #include <gqe/executor/optimization_parameters.hpp>
 #include <gqe/executor/task.hpp>
 #include <gqe/memory_resource/boost_shared_memory_resource.hpp>
+#include <gqe/memory_resource/managed_query_memory_resource.hpp>
 #include <gqe/memory_resource/memory_utilities.hpp>
 #include <gqe/memory_resource/numa_memory_resource.hpp>
 #include <gqe/memory_resource/numa_pool_memory_resource.hpp>
@@ -52,13 +53,27 @@
 #include <rmm/mr/managed_memory_resource.hpp>
 #include <rmm/mr/statistics_resource_adaptor.hpp>
 
+#include <cstdlib>
 #include <memory>
 #include <optional>
+#include <stdexcept>
+#include <string>
 
 namespace gqe {
 
 namespace {
 using any_device_resource = cuda::mr::any_resource<cuda::mr::device_accessible>;
+
+// flowcsd managed-memory: capacity of the managed query pool [bytes]. Required, because a missing
+// value must not fall back to stock GQE's device pool silently.
+std::size_t managed_query_memory_bytes()
+{
+  char const* value = std::getenv("FLOWCSD_MANAGED_QUERY_MEMORY_BYTES");
+  if (value == nullptr) {
+    throw std::runtime_error("FLOWCSD_MANAGED_QUERY_MEMORY_BYTES is not set (flowcsd managed-memory)");
+  }
+  return rmm::align_down(std::stoull(value), rmm::CUDA_ALLOCATION_ALIGNMENT);
+}
 
 }  // namespace
 
@@ -224,8 +239,21 @@ multi_process_task_manager_context::multi_process_task_manager_context(
   std::shared_ptr<gqe::pgas_memory_resource> shared_upstream{std::move(upstream_mr)};
   auto pgas_upstream = cuda::mr::any_resource<cuda::mr::device_accessible>{
     memory_resource::shared_resource_adaptor{std::move(shared_upstream)}};
-  _mr = cuda::mr::any_resource<cuda::mr::device_accessible>{
-    rmm::mr::pool_memory_resource{std::move(pgas_upstream), pool_bytes, pool_bytes}};
+  // flowcsd managed-memory: the pool on the NVSHMEM symmetric heap holds only the buffers a Parquet
+  // scan reads into (scan_buffer_scope); every other query allocation comes from a pool on CUDA
+  // managed memory, as Sirius's memory.gpu.managed_memory setting.
+  auto const managed_bytes = managed_query_memory_bytes();
+  GQE_LOG_INFO("flowcsd_managed_memory scan_buffer_pool_bytes={} managed_query_memory_bytes={}",
+               pool_bytes,
+               managed_bytes);
+  memory_resource::managed_query_memory_resource query_memory{
+    any_device_resource{rmm::mr::pool_memory_resource{std::move(pgas_upstream), pool_bytes, pool_bytes}},
+    any_device_resource{
+      rmm::mr::pool_memory_resource{any_device_resource{rmm::mr::managed_memory_resource{}},
+                                    0,
+                                    std::make_optional(managed_bytes)}}};
+  memory_resource::scan_output_resource() = query_memory.managed_pool();
+  _mr = any_device_resource{std::move(query_memory)};
   rmm::mr::set_current_device_resource(_mr);
 }
 
