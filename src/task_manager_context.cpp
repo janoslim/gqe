@@ -20,6 +20,7 @@
 #include <gqe/executor/optimization_parameters.hpp>
 #include <gqe/executor/task.hpp>
 #include <gqe/memory_resource/boost_shared_memory_resource.hpp>
+#include <gqe/memory_resource/managed_overflow_resource.hpp>
 #include <gqe/memory_resource/memory_utilities.hpp>
 #include <gqe/memory_resource/numa_memory_resource.hpp>
 #include <gqe/memory_resource/numa_pool_memory_resource.hpp>
@@ -224,8 +225,11 @@ multi_process_task_manager_context::multi_process_task_manager_context(
   std::shared_ptr<gqe::pgas_memory_resource> shared_upstream{std::move(upstream_mr)};
   auto pgas_upstream = cuda::mr::any_resource<cuda::mr::device_accessible>{
     memory_resource::shared_resource_adaptor{std::move(shared_upstream)}};
+  // flowcsd managed-overflow: the query pool stays on the NVSHMEM symmetric heap as in stock GQE;
+  // requests the full pool cannot serve go to CUDA managed memory instead of failing the query.
   _mr = cuda::mr::any_resource<cuda::mr::device_accessible>{
-    rmm::mr::pool_memory_resource{std::move(pgas_upstream), pool_bytes, pool_bytes}};
+    memory_resource::managed_overflow_resource{cuda::mr::any_resource<cuda::mr::device_accessible>{
+      rmm::mr::pool_memory_resource{std::move(pgas_upstream), pool_bytes, pool_bytes}}}};
   rmm::mr::set_current_device_resource(_mr);
 }
 
